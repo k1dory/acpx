@@ -37,6 +37,8 @@ out, _ := conn.Steer(ctx, s.SessionId, "also update the tests") // injected | pr
 | `Conn` | The SDK's `ClientSideConnection` over a `Wire`. Adds `Steer`: the `_session/steering` extension (claude-agent-acp, codex-acp), which puts a message into the turn in progress. It uses `idleBehavior: promptRequired`, so the client still owns every turn. |
 | `Configure` | Selects a session's mode, model or reasoning level (`thought_level`) through the agent's configuration options. Mode falls back to `session/set_mode`. It matches the agent's own values: the exact value, a provider-qualified value (`anthropic/claude-…`), or a display name. It returns the session's state after the change: a new model may offer other reasoning levels. Anything it cannot apply comes back as an error to report. |
 | `SessionMeta` | Builds a session request's `_meta` from your metadata (for example claude-agent-acp's `claudeCode.options`) plus the system prompt. |
+| `Request`, `Pending` | Relays to a person what the agent asks them, for a headless client. A `session/request_permission` becomes `PermissionRequest`; an `elicitation/create` becomes `ElicitationRequest`, as a form with its JSON Schema or as a link such as an OAuth sign-in. Your client shows the request and sends back a `Reply`. `PermissionResponse` and `ElicitationResponse` turn that reply into the agent's answer and check it against the request. `Pending` keeps the agent's request open until the reply arrives, the time limit passes, or the context ends. |
+| `PromptBlocks` | Builds a prompt from text plus `resource_link` blocks for attached files. Every ACP agent takes these, so the agent sees the files as files. |
 
 When the SDK gains these fields, the wire-level parts can be removed.
 
