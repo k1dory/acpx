@@ -5,10 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	acp "github.com/coder/acp-go-sdk"
 )
@@ -54,36 +57,84 @@ func TestWireAdvertisesSessionCapabilities(t *testing.T) {
 	}
 }
 
-// The Wire reads steering support off initialize's _meta, and hands over notices, compaction
-// updates and summary chunks; other updates and malformed ones are not its business.
-func TestWireReadsSteeringAndExtraUpdates(t *testing.T) {
-	var got []ExtraUpdate
+// The Wire reads steering support off initialize's _meta; the updates the SDK does not know reach
+// the client in their place among the SDK's own, through Classify: a notice is not taken for the
+// session_info_update the SDK decodes it as, a message around it stays one message.
+func TestClassifyKeepsOrderAndKind(t *testing.T) {
 	lines := strings.Join([]string{
 		`{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{},"_meta":{"steering":{"supported":true}}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hel"}}}}`,
 		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"notice","severity":"warning","title":"Rate limit near","description":"80% used"}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"lo"}}}}`,
 		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"compaction_update","compactionId":"c1","status":"in_progress"}}}`,
 		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"compaction_summary_chunk","compactionId":"c1","content":{"type":"text","text":"so far"}}}}`,
 		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"compaction_update","compactionId":"c1","status":"completed","summary":[{"type":"text","text":"done"}]}}}`,
-		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}}}}`,
-		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"notice","severity":"info"}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"subagent_update","child":"x"}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"session_info_update","title":"Real title"}}}`,
 	}, "\n") + "\n"
-	w := NewWire(io.Discard, chunked{strings.NewReader(lines), 5}, WireOptions{OnUpdate: func(u ExtraUpdate) { got = append(got, u) }})
-	if b, err := io.ReadAll(w); err != nil || string(b) != lines {
-		t.Fatalf("bytes changed: %v", err)
+	c := &classifying{done: make(chan struct{})}
+	c.wire = NewWire(io.Discard, chunked{strings.NewReader(lines), 5}, WireOptions{})
+	c.wire.Connect(c)
+	select {
+	case <-c.done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("updates: %q", c.got)
 	}
+	want := []string{"sdk agent_message_chunk Hel", "notice warning Rate limit near 80% used", "sdk agent_message_chunk lo",
+		"compaction c1 in_progress ", "summary c1 so far", "compaction c1 completed done", "unknown", "sdk session_info_update Real title"}
+	if !c.wire.Steering() || !reflect.DeepEqual(c.got, want) {
+		t.Fatalf("steering %v, updates:\n%q\nwant\n%q", c.wire.Steering(), c.got, want)
+	}
+}
+
+// classifying is a client that records what Classify makes of every update.
+type classifying struct {
+	acp.Client
+	wire *Wire
+	mu   sync.Mutex
+	got  []string
+	done chan struct{}
+}
+
+func (c *classifying) SessionUpdate(_ context.Context, n acp.SessionNotification) error {
+	extra, sdk := c.wire.Classify(n.Update)
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	switch {
-	case !w.Steering() || w.SystemPrompt():
-		t.Fatalf("capabilities: steering %v system prompt %v", w.Steering(), w.SystemPrompt())
-	case len(got) != 4:
-		t.Fatalf("updates: %+v", got)
-	case got[0].SessionID != "s1" || got[0].Notice == nil || *got[0].Notice != (Notice{Severity: "warning", Title: "Rate limit near", Description: "80% used"}):
-		t.Fatalf("notice: %+v", got[0])
-	case got[1].Compaction == nil || got[1].Compaction.Status != "in_progress":
-		t.Fatalf("compaction start: %+v", got[1])
-	case got[2].SummaryChunk == nil || got[2].SummaryChunk.Text != "so far":
-		t.Fatalf("summary chunk: %+v", got[2])
-	case got[3].Compaction == nil || got[3].Compaction.Status != "completed" || got[3].Compaction.Summary != "done":
-		t.Fatalf("compaction end: %+v", got[3])
+	case sdk && n.Update.AgentMessageChunk != nil:
+		c.got = append(c.got, "sdk agent_message_chunk "+n.Update.AgentMessageChunk.Content.Text.Text)
+	case sdk && n.Update.SessionInfoUpdate != nil:
+		c.got = append(c.got, "sdk session_info_update "+*n.Update.SessionInfoUpdate.Title)
+	case sdk:
+		c.got = append(c.got, "sdk "+KindOf(n.Update))
+	case extra == nil:
+		c.got = append(c.got, "unknown")
+	case extra.Notice != nil:
+		c.got = append(c.got, fmt.Sprintf("notice %s %s %s", extra.Notice.Severity, extra.Notice.Title, extra.Notice.Description))
+	case extra.Compaction != nil:
+		c.got = append(c.got, fmt.Sprintf("compaction %s %s %s", extra.Compaction.ID, extra.Compaction.Status, extra.Compaction.Summary))
+	case extra.SummaryChunk != nil:
+		c.got = append(c.got, fmt.Sprintf("summary %s %s", extra.SummaryChunk.ID, extra.SummaryChunk.Text))
+	}
+	if len(c.got) == 8 {
+		close(c.done)
+	}
+	return nil
+}
+
+// A known update the SDK refused to deliver does not shift the rest: Classify skips past it.
+func TestClassifyResynchronises(t *testing.T) {
+	w := NewWire(io.Discard, strings.NewReader(strings.Join([]string{
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"broken"}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"x"}}}}`,
+	}, "\n")+"\n"), WireOptions{})
+	_, _ = io.ReadAll(w)
+	if extra, sdk := w.Classify(acp.UpdateAgentMessageText("x")); !sdk || extra != nil {
+		t.Fatalf("resync: %v %v", extra, sdk)
+	}
+	// Nothing read: the SDK's update stands.
+	if _, sdk := w.Classify(acp.UpdateAgentMessageText("y")); !sdk {
+		t.Fatal("empty queue")
 	}
 }
 
@@ -195,22 +246,59 @@ func TestConfigureThoughtLevel(t *testing.T) {
 		[2]string{"low", "Low"}, [2]string{"medium", "Medium"}, [2]string{"xhigh", "Extra high"})}}
 	r := &recordingConfigurer{}
 	for _, want := range []string{"low", "Extra high", "medium"} {
-		if err := Configure(ctx, r, "s", st, ThoughtLevelSetting, want); err != nil {
+		if _, err := Configure(ctx, r, "s", st, ThoughtLevelSetting, want); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if strings.Join(r.calls, ",") != "reasoning_effort=low,reasoning_effort=xhigh" {
 		t.Fatalf("calls: %v", r.calls)
 	}
-	if err := Configure(ctx, r, "s", st, ThoughtLevelSetting, "ultra"); err == nil || !strings.Contains(err.Error(), `thought_level "ultra" is not one the agent offers [low medium xhigh]`) {
+	if _, err := Configure(ctx, r, "s", st, ThoughtLevelSetting, "ultra"); err == nil || !strings.Contains(err.Error(), `thought_level "ultra" is not one the agent offers [low medium xhigh]`) {
 		t.Fatalf("unknown level: %v", err)
 	}
-	if err := Configure(ctx, r, "s", SessionState{}, ThoughtLevelSetting, "low"); err == nil || !strings.Contains(err.Error(), "offers no thought_level option") {
+	if _, err := Configure(ctx, r, "s", SessionState{}, ThoughtLevelSetting, "low"); err == nil || !strings.Contains(err.Error(), "offers no thought_level option") {
 		t.Fatalf("no option: %v", err)
 	}
-	if err := Configure(ctx, r, "s", st, ThoughtLevelSetting, ""); err != nil || len(r.calls) != 2 {
+	if _, err := Configure(ctx, r, "s", st, ThoughtLevelSetting, ""); err != nil || len(r.calls) != 2 {
 		t.Fatalf("empty: %v %v", err, r.calls)
 	}
+}
+
+// Selecting a model can change the other options (another model offers other reasoning levels):
+// the state Configure returns is the agent's answer, and the next selection goes by it.
+func TestConfigureFollowsTheAgentsOptions(t *testing.T) {
+	ctx := context.Background()
+	st := SessionState{Options: []acp.SessionConfigOption{
+		option("model", acp.SessionConfigOptionCategoryModel, "small", [2]string{"small", "Small"}, [2]string{"big", "Big"}),
+		option("effort", acp.SessionConfigOptionCategoryThoughtLevel, "low", [2]string{"low", "Low"})}}
+	r := &answeringConfigurer{after: []acp.SessionConfigOption{
+		option("model", acp.SessionConfigOptionCategoryModel, "big", [2]string{"small", "Small"}, [2]string{"big", "Big"}),
+		option("effort", acp.SessionConfigOptionCategoryThoughtLevel, "low", [2]string{"low", "Low"}, [2]string{"xhigh", "Extra high"})}}
+	st, err := Configure(ctx, r, "s", st, ModelSetting, "big")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Configure(ctx, r, "s", st, ThoughtLevelSetting, "xhigh"); err != nil || strings.Join(r.calls, ",") != "model=big,effort=xhigh" {
+		t.Fatalf("after the model: %v %v", err, r.calls)
+	}
+	// A mode change is remembered too: setting it again does nothing.
+	ms := SessionState{Modes: &acp.SessionModeState{CurrentModeId: "a", AvailableModes: []acp.SessionMode{{Id: "a"}, {Id: "b"}}}}
+	rc := &recordingConfigurer{}
+	ms, _ = Configure(ctx, rc, "s", ms, ModeSetting, "b")
+	_, _ = Configure(ctx, rc, "s", ms, ModeSetting, "b")
+	if strings.Join(rc.calls, ",") != "mode=b" || ms.Modes.CurrentModeId != "b" {
+		t.Fatalf("mode: %v %v", rc.calls, ms.Modes.CurrentModeId)
+	}
+}
+
+type answeringConfigurer struct {
+	recordingConfigurer
+	after []acp.SessionConfigOption
+}
+
+func (a *answeringConfigurer) SetSessionConfigOption(ctx context.Context, p acp.SetSessionConfigOptionRequest) (acp.SetSessionConfigOptionResponse, error) {
+	_, _ = a.recordingConfigurer.SetSessionConfigOption(ctx, p)
+	return acp.SetSessionConfigOptionResponse{ConfigOptions: a.after}, nil
 }
 
 // A session request's _meta: the caller's metadata and the system prompt marker, never shared

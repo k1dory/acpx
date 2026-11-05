@@ -6,6 +6,8 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+
+	acp "github.com/coder/acp-go-sdk"
 )
 
 // SystemPromptMetaKey marks a session request's system prompt: the text, in the request's _meta.
@@ -18,16 +20,12 @@ const SystemPromptMetaKey = "acpx/systemPrompt"
 // cut into reads, a line up to it is looked at whole and a longer one not at all.
 const MaxLine = 10 << 20
 
-// WireOptions says what the client advertises beyond the SDK's ClientCapabilities and where the
-// session updates the SDK cannot decode go.
+// WireOptions says what the client advertises beyond the SDK's ClientCapabilities.
 type WireOptions struct {
 	// Notices and Compaction advertise clientCapabilities.session.notices / .compaction in
 	// initialize: an agent sends notice, compaction_update and compaction_summary_chunk only to a
-	// client that does.
+	// client that does. The client then gets them from Classify, in its SessionUpdate.
 	Notices, Compaction bool
-	// OnUpdate receives those updates. It runs on the reading goroutine, before the SDK has
-	// processed the lines that came earlier: an update's place among the SDK's own is not exact.
-	OnUpdate func(ExtraUpdate)
 }
 
 // Wire sits between the SDK's connection and the agent's stdio (Writer: to the agent, Reader:
@@ -45,7 +43,22 @@ type Wire struct {
 	mu   sync.Mutex
 	buf  []byte
 	skip bool // the current line is longer than MaxLine: ignored up to its newline
+
+	// updates are the session/update notifications read so far and not yet classified, in the
+	// order they came: what each really is (Classify).
+	umu     sync.Mutex
+	updates []wireUpdate
 }
+
+// wireUpdate is one session/update notification as the Wire read it: its kind and, for a kind
+// the SDK does not decode, what acpx decoded of it.
+type wireUpdate struct {
+	kind  string
+	extra *ExtraUpdate
+}
+
+// maxPendingUpdates bounds the classification queue of a client that never calls Classify.
+const maxPendingUpdates = 1 << 16
 
 // NewWire layers a Wire over the agent's stdin (w) and stdout (r).
 func NewWire(agentStdin io.Writer, agentStdout io.Reader, opts WireOptions) *Wire {
@@ -106,11 +119,43 @@ func (x *Wire) inspect(line []byte) {
 	if !x.initialized.Load() && bytes.Contains(line, []byte(`"protocolVersion"`)) {
 		x.inspectInitialize(line)
 	}
-	if x.opts.OnUpdate != nil && bytes.Contains(line, []byte(`"session/update"`)) {
-		if u, ok := decodeExtraUpdate(line); ok {
-			x.opts.OnUpdate(u)
+	if bytes.Contains(line, []byte(`"session/update"`)) {
+		if kind, extra, ok := decodeUpdate(line); ok {
+			x.umu.Lock()
+			if len(x.updates) >= maxPendingUpdates {
+				x.updates = x.updates[1:]
+			}
+			x.updates = append(x.updates, wireUpdate{kind: kind, extra: extra})
+			x.umu.Unlock()
 		}
 	}
+}
+
+// Classify says what a session update the SDK hands its client really is. The client calls it
+// once for every SessionUpdate, in order (the SDK delivers notifications in the order they came).
+//
+// acp-go-sdk v0.13.5 does not know every kind of update: one it does not know is not dropped but
+// decoded as whichever known kind its fields fit (a notice with a title arrives as a
+// session_info_update). Classify matches the call with the notification the Wire read: sdk is
+// true for an update the SDK decoded as what it is; otherwise the SDK's update is to be ignored,
+// and extra is what acpx decoded of it (a notice, a compaction update or summary chunk; nil for a
+// kind acpx does not decode either).
+func (x *Wire) Classify(u acp.SessionUpdate) (extra *ExtraUpdate, sdk bool) {
+	got := KindOf(u)
+	x.umu.Lock()
+	defer x.umu.Unlock()
+	for len(x.updates) > 0 {
+		e := x.updates[0]
+		x.updates = x.updates[1:]
+		switch {
+		case e.kind == got:
+			return nil, true
+		case !sdkKinds[e.kind]:
+			return e.extra, false
+		}
+		// A known kind the SDK did not deliver (it refused the line): the next one is this call's.
+	}
+	return nil, true
 }
 
 func (x *Wire) inspectInitialize(line []byte) {

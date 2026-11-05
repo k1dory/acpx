@@ -16,10 +16,16 @@ type Conn struct {
 	Wire *Wire
 }
 
-// Dial connects client to an agent over its stdin and stdout through a Wire.
+// Dial connects client to an agent over its stdin and stdout through a Wire. A client that calls
+// Wire.Classify needs the Wire before the connection starts delivering updates: it makes the Wire
+// with NewWire and connects with Wire.Connect instead.
 func Dial(client acp.Client, agentStdin io.Writer, agentStdout io.Reader, opts WireOptions) *Conn {
-	w := NewWire(agentStdin, agentStdout, opts)
-	return &Conn{ClientSideConnection: acp.NewClientSideConnection(client, w, w), Wire: w}
+	return NewWire(agentStdin, agentStdout, opts).Connect(client)
+}
+
+// Connect starts the SDK's client-side connection for client over the Wire.
+func (x *Wire) Connect(client acp.Client) *Conn {
+	return &Conn{ClientSideConnection: acp.NewClientSideConnection(client, x, x), Wire: x}
 }
 
 // SteerMethod is the steering extension (claude-agent-acp, codex-acp): a message joins the turn in

@@ -44,12 +44,15 @@ var (
 	ThoughtLevelSetting = Setting{Name: "thought_level", Category: acp.SessionConfigOptionCategoryThoughtLevel, Match: MatchValueOrName}
 )
 
-// Configure selects want for the setting in a session. It changes nothing when the session already
-// has it; what cannot be applied (no such option, a value the agent does not offer, a refusal) is
-// returned as an error to report, and the session keeps the agent's own value.
-func Configure(ctx context.Context, cf Configurer, sid acp.SessionId, st SessionState, s Setting, want string) error {
+// Configure selects want for the setting in a session and returns the session's state after it:
+// selecting one option may change the others (codex-acp offers other reasoning levels for another
+// model), so the next Configure is to be given that state. It changes nothing when the session
+// already has the value; what cannot be applied (no such option, a value the agent does not
+// offer, a refusal) is returned as an error to report, with the state unchanged, and the session
+// keeps the agent's own value.
+func Configure(ctx context.Context, cf Configurer, sid acp.SessionId, st SessionState, s Setting, want string) (SessionState, error) {
 	if want == "" {
-		return nil
+		return st, nil
 	}
 	if opt := ConfigOption(st.Options, s.Category); opt != nil {
 		value := want
@@ -59,37 +62,63 @@ func Configure(ctx context.Context, cf Configurer, sid acp.SessionId, st Session
 			value = ""
 		}
 		if value == "" {
-			return fmt.Errorf("%s %q is not one the agent offers %v: it stays %q", s.Name, want, abbreviate(SelectValues(opt)), opt.CurrentValue)
+			return st, fmt.Errorf("%s %q is not one the agent offers %v: it stays %q", s.Name, want, abbreviate(SelectValues(opt)), opt.CurrentValue)
 		}
 		if string(opt.CurrentValue) == value {
-			return nil
+			return st, nil
 		}
-		if _, err := cf.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
-			SessionId: sid, ConfigId: opt.Id, Value: acp.SessionConfigValueId(value)}}); err != nil {
-			return fmt.Errorf("acp session/set_config_option %s=%s: %w", opt.Id, value, err)
+		resp, err := cf.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
+			SessionId: sid, ConfigId: opt.Id, Value: acp.SessionConfigValueId(value)}})
+		if err != nil {
+			return st, fmt.Errorf("acp session/set_config_option %s=%s: %w", opt.Id, value, err)
 		}
-		return nil
+		next := st
+		if len(resp.ConfigOptions) > 0 {
+			next.Options = resp.ConfigOptions // the agent's options as they are now
+		} else {
+			next.Options = withCurrent(st.Options, opt.Id, value)
+		}
+		return next, nil
 	}
 	if !s.Modes {
-		return fmt.Errorf("the agent offers no %s option: %s %q is left to its configuration", s.Category, s.Name, want)
+		return st, fmt.Errorf("the agent offers no %s option: %s %q is left to its configuration", s.Category, s.Name, want)
 	}
 	if st.Modes == nil || len(st.Modes.AvailableModes) == 0 {
-		return fmt.Errorf("the agent declares no session modes: %s %q is not applied", s.Name, want)
+		return st, fmt.Errorf("the agent declares no session modes: %s %q is not applied", s.Name, want)
 	}
 	var ids []string
 	for _, m := range st.Modes.AvailableModes {
 		ids = append(ids, string(m.Id))
 	}
 	if !slices.Contains(ids, want) {
-		return fmt.Errorf("%s %q is not a mode the agent offers %v: the agent stays in %q", s.Name, want, ids, st.Modes.CurrentModeId)
+		return st, fmt.Errorf("%s %q is not a mode the agent offers %v: the agent stays in %q", s.Name, want, ids, st.Modes.CurrentModeId)
 	}
 	if string(st.Modes.CurrentModeId) == want {
-		return nil
+		return st, nil
 	}
 	if _, err := cf.SetSessionMode(ctx, acp.SetSessionModeRequest{SessionId: sid, ModeId: acp.SessionModeId(want)}); err != nil {
-		return fmt.Errorf("acp session/set_mode %s: %w", want, err)
+		return st, fmt.Errorf("acp session/set_mode %s: %w", want, err)
 	}
-	return nil
+	next := st
+	modes := *st.Modes
+	modes.CurrentModeId = acp.SessionModeId(want)
+	next.Modes = &modes
+	return next, nil
+}
+
+// withCurrent is options with the select option id set to value (an agent that answered a change
+// without its options).
+func withCurrent(options []acp.SessionConfigOption, id acp.SessionConfigId, value string) []acp.SessionConfigOption {
+	out := make([]acp.SessionConfigOption, len(options))
+	copy(out, options)
+	for i, o := range out {
+		if o.Select != nil && o.Select.Id == id {
+			sel := *o.Select
+			sel.CurrentValue = acp.SessionConfigValueId(value)
+			out[i].Select = &sel
+		}
+	}
+	return out
 }
 
 // ConfigOption is the first select option of the category, nil when there is none.

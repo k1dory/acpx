@@ -3,10 +3,12 @@ package acpx
 import (
 	"encoding/json"
 	"strings"
+
+	acp "github.com/coder/acp-go-sdk"
 )
 
-// Session update kinds acp-go-sdk v0.13.5 does not decode (it hands its client an empty update
-// for them). The Wire decodes them for the client that advertised them (WireOptions).
+// Session update kinds acp-go-sdk v0.13.5 does not decode (it hands its client another kind's
+// update for them, see Wire.Classify). The Wire decodes them for the client.
 const (
 	UpdateNotice                 = "notice"
 	UpdateCompaction             = "compaction_update"
@@ -42,6 +44,75 @@ type ExtraUpdate struct {
 	Notice       *Notice
 	Compaction   *Compaction
 	SummaryChunk *CompactionSummaryChunk
+}
+
+// sdkKinds are the update kinds acp-go-sdk v0.13.5 decodes.
+var sdkKinds = map[string]bool{
+	"user_message_chunk": true, "agent_message_chunk": true, "agent_thought_chunk": true,
+	"tool_call": true, "tool_call_update": true, "plan": true, "plan_update": true, "plan_removed": true,
+	"available_commands_update": true, "current_mode_update": true, "config_option_update": true,
+	"session_info_update": true, "usage_update": true,
+}
+
+// KindOf is the sessionUpdate kind of an update as the SDK decoded it ("" for none).
+func KindOf(u acp.SessionUpdate) string {
+	switch {
+	case u.UserMessageChunk != nil:
+		return "user_message_chunk"
+	case u.AgentMessageChunk != nil:
+		return "agent_message_chunk"
+	case u.AgentThoughtChunk != nil:
+		return "agent_thought_chunk"
+	case u.ToolCall != nil:
+		return "tool_call"
+	case u.ToolCallUpdate != nil:
+		return "tool_call_update"
+	case u.Plan != nil:
+		return "plan"
+	case u.PlanUpdate != nil:
+		return "plan_update"
+	case u.PlanRemoved != nil:
+		return "plan_removed"
+	case u.AvailableCommandsUpdate != nil:
+		return "available_commands_update"
+	case u.CurrentModeUpdate != nil:
+		return "current_mode_update"
+	case u.ConfigOptionUpdate != nil:
+		return "config_option_update"
+	case u.SessionInfoUpdate != nil:
+		return "session_info_update"
+	case u.UsageUpdate != nil:
+		return "usage_update"
+	}
+	return ""
+}
+
+// decodeUpdate reads a session/update notification: its kind and, for one the SDK does not
+// decode, what acpx decodes of it (nil when acpx does not either).
+func decodeUpdate(line []byte) (kind string, extra *ExtraUpdate, ok bool) {
+	var msg struct {
+		Method string `json:"method"`
+		Params struct {
+			SessionID string          `json:"sessionId"`
+			Update    json.RawMessage `json:"update"`
+		} `json:"params"`
+	}
+	if json.Unmarshal(line, &msg) != nil || msg.Method != "session/update" {
+		return "", nil, false
+	}
+	var k struct {
+		SessionUpdate string `json:"sessionUpdate"`
+	}
+	if json.Unmarshal(msg.Params.Update, &k) != nil || k.SessionUpdate == "" {
+		return "", nil, false
+	}
+	if sdkKinds[k.SessionUpdate] {
+		return k.SessionUpdate, nil, true
+	}
+	if u, ok := decodeExtraUpdate(line); ok {
+		return k.SessionUpdate, &u, true
+	}
+	return k.SessionUpdate, nil, true
 }
 
 // decodeExtraUpdate reads a session/update notification of a kind the SDK does not decode.

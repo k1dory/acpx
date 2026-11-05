@@ -11,10 +11,9 @@ It was written for a headless client that drives agents in sandboxes
 but it does not depend on that project.
 
 ```go
-conn := acpx.Dial(client, agentStdin, agentStdout, acpx.WireOptions{
-	Notices: true, Compaction: true,
-	OnUpdate: func(u acpx.ExtraUpdate) { /* notice, compaction_update, compaction_summary_chunk */ },
-})
+wire := acpx.NewWire(agentStdin, agentStdout, acpx.WireOptions{Notices: true, Compaction: true})
+client.wire = wire // in its SessionUpdate: extra, sdk := wire.Classify(n.Update)
+conn := wire.Connect(client)
 init, _ := conn.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
 
 var meta map[string]any
@@ -34,9 +33,9 @@ out, _ := conn.Steer(ctx, s.SessionId, "also update the tests") // injected | pr
 
 | | |
 |---|---|
-| `Wire` | A JSON-RPC layer between the connection and the agent's stdio. The SDK drops some fields from `initialize`; `Wire` reads two of them, `sessionCapabilities.systemPrompt` and `_meta.steering.supported`. It advertises `clientCapabilities.session.notices` / `.compaction`, which `ClientCapabilities` cannot express. It carries a session's client system prompt (`systemPrompt`, mode `append`). It also decodes `notice`, `compaction_update` and `compaction_summary_chunk`, which the SDK silently zeroes. Lines are handled up to the SDK's own 10 MiB limit, the same way however the agent's output is split into reads. |
+| `Wire` | A JSON-RPC layer between the connection and the agent's stdio. The SDK drops some fields from `initialize`; `Wire` reads two of them, `sessionCapabilities.systemPrompt` and `_meta.steering.supported`. It advertises `clientCapabilities.session.notices` / `.compaction`, which `ClientCapabilities` cannot express. It carries a session's client system prompt (`systemPrompt`, mode `append`). It also decodes `notice`, `compaction_update` and `compaction_summary_chunk`. The SDK does not drop an update kind it does not know: it decodes it as whichever known kind its fields fit, so a notice with a title arrives as a `session_info_update`. `Classify` matches every update the SDK delivers with what was actually read. Called in the client's `SessionUpdate`, it says whether the SDK's update is genuine or is one of acpx's, keeping its place in the stream. Lines are handled up to the SDK's own 10 MiB limit, the same way however the agent's output is split into reads. |
 | `Conn` | The SDK's `ClientSideConnection` over a `Wire`. Adds `Steer`: the `_session/steering` extension (claude-agent-acp, codex-acp), which puts a message into the turn in progress. It uses `idleBehavior: promptRequired`, so the client still owns every turn. |
-| `Configure` | Selects a session's mode, model or reasoning level (`thought_level`) through the agent's configuration options. Mode falls back to `session/set_mode`. It matches the agent's own values: the exact value, a provider-qualified value (`anthropic/claude-…`), or a display name. Anything it cannot apply comes back as an error to report. |
+| `Configure` | Selects a session's mode, model or reasoning level (`thought_level`) through the agent's configuration options. Mode falls back to `session/set_mode`. It matches the agent's own values: the exact value, a provider-qualified value (`anthropic/claude-…`), or a display name. It returns the session's state after the change: a new model may offer other reasoning levels. Anything it cannot apply comes back as an error to report. |
 | `SessionMeta` | Builds a session request's `_meta` from your metadata (for example claude-agent-acp's `claudeCode.options`) plus the system prompt. |
 
 When the SDK gains these fields, the wire-level parts can be removed.
